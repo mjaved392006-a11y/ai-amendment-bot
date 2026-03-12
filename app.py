@@ -6,7 +6,7 @@ from video_qc import run_video_qc
 
 st.set_page_config(page_title="AI Amendment Bot — QC Board", layout="wide")
 
-st.markdown("### Koochester")
+st.markdown("### Koocester")
 st.title("AI Amendment Bot — QC Board")
 
 st.caption("Upload a video → generate transcript → run QC on spoken content.")
