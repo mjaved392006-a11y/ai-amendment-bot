@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.env
+.streamlit/secrets.toml
+
+*.pem
+*.zip
+*.mp4
+*.mov
+*.mkv
+*.mpeg4

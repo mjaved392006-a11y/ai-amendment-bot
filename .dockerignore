@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.git/
+.gitignore
+.dockerignore
+
+.env
+.streamlit/secrets.toml
+
+*.pem
+*.zip
+*.mp4
+*.mov
+*.mkv
+*.mpeg4

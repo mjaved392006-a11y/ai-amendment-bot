@@ -1,0 +1,9 @@
+streamlit
+requests
+pandas
+faster-whisper
+pyspellchecker
+python-docx
+gdown
+supabase
+openai
