@@ -206,7 +206,7 @@ def reset_stale_jobs(stale_after_minutes: int = 30) -> int:
     response = (
         _client()
         .table("jobs")
-        .update({"status": "queued", "started_at": None, "progress": ""})
+        .update({"status": "queued", "started_at": None})
         .eq("status", "processing")
         .lt("started_at", cutoff)
         .execute()

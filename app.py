@@ -63,9 +63,9 @@ with st.sidebar:
     st.session_state["severity_filter"] = severity_filter
 
     st.divider()
-    if st.button("Reset analysis", use_container_width=True):
+    if st.button("Reset analysis", width='stretch'):
         for key in (
-            "qc_result", "video_path", "video_bytes", "video_mime",
+            "qc_result", "video_path", "video_mime",
             "uploaded_name", "activity_log_entries", "activity_log_started_at",
             "edited_transcript_text", "analysis_job_id", "analysis_job_started_at",
             "analysis_job_status",
@@ -165,6 +165,24 @@ def _transcript_context_for_timestamp(segment_data, target_ts, window=1):
     return [indexed[j][2] for j in range(lo, hi)]
 
 
+def _get_video_bytes() -> bytes | None:
+    """Read video bytes from temp file on demand — never held in session_state
+    to avoid exhausting Streamlit Cloud's 1 GB RAM limit for large files."""
+    path = st.session_state.get("video_path")
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _get_video_size_mb() -> float:
+    """Return the size of the temp video file in MB without reading it into RAM."""
+    path = st.session_state.get("video_path")
+    if not path or not os.path.exists(path):
+        return 0.0
+    return os.path.getsize(path) / (1024 * 1024)
+
+
 def _persist_uploaded_video(uploaded):
     """Save uploaded bytes to a temp file ONCE per upload, store path in session_state."""
     if st.session_state.get("uploaded_name") == uploaded.name and st.session_state.get("video_path"):
@@ -185,7 +203,8 @@ def _persist_uploaded_video(uploaded):
 
     st.session_state["uploaded_name"] = uploaded.name
     st.session_state["video_path"] = path
-    st.session_state["video_bytes"] = uploaded.getbuffer().tobytes()
+    # NOTE: we intentionally do NOT store video_bytes in session_state.
+    # Bytes are read from the temp file on demand via _get_video_bytes().
     st.session_state["video_mime"] = uploaded.type or "video/mp4"
     # New upload invalidates any prior result.
     st.session_state.pop("qc_result", None)
@@ -206,15 +225,15 @@ with tab_upload:
     if uploaded:
         video_path = _persist_uploaded_video(uploaded)
 
-        size_mb = len(st.session_state["video_bytes"]) / (1024 * 1024)
+        size_mb = _get_video_size_mb()
 
         preview_col, info_col = st.columns([2, 1])
         with preview_col:
-            st.video(st.session_state["video_bytes"])
+            st.video(_get_video_bytes())
         with info_col:
             st.metric("File size", f"{size_mb:.1f} MB")
             st.write(f"**File name:** {uploaded.name}")
-            if size_mb > 200:
+            if size_mb > 500:
                 st.warning(
                     "Large file — transcription and analysis may take several minutes "
                     "and cost more API credits."
@@ -250,11 +269,9 @@ with tab_drive:
                 try:
                     drive_path = download_drive_video(drive_url.strip())
                     # Store in session state the same way the uploader does
-                    with open(drive_path, "rb") as f:
-                        drive_bytes = f.read()
                     st.session_state["uploaded_name"] = f"drive_{drive_url[-20:].replace('/', '_')}.mp4"
                     st.session_state["video_path"] = drive_path
-                    st.session_state["video_bytes"] = drive_bytes
+                    # Don't store bytes — read on demand via _get_video_bytes()
                     st.session_state["video_mime"] = "video/mp4"
                     st.session_state.pop("qc_result", None)
                     st.session_state.pop("edited_transcript_text", None)
@@ -266,16 +283,16 @@ with tab_drive:
                     st.error(str(e))
 
     # Show preview if a Drive video was loaded
-    if st.session_state.get("video_bytes") and st.session_state.get("uploaded_name", "").startswith("drive_"):
-        size_mb = len(st.session_state["video_bytes"]) / (1024 * 1024)
+    if st.session_state.get("video_path") and st.session_state.get("uploaded_name", "").startswith("drive_"):
+        size_mb = _get_video_size_mb()
         prev_col, info_col = st.columns([2, 1])
         with prev_col:
-            st.video(st.session_state["video_bytes"])
+            st.video(_get_video_bytes())
         with info_col:
             st.metric("File size", f"{size_mb:.1f} MB")
 
 # --- Shared: show Analyze button if any video is ready ---
-video_ready = bool(st.session_state.get("video_path") and st.session_state.get("video_bytes"))
+video_ready = bool(st.session_state.get("video_path") and os.path.exists(st.session_state.get("video_path", "")))
 
 if video_ready:
 
@@ -292,7 +309,7 @@ if video_ready:
             activity_log.emit("job_submit", "Uploading video and creating background analysis job...")
             render_sidebar(activity_log, activity_placeholder)
             job = submit_analysis_job(
-                st.session_state["video_bytes"],
+                _get_video_bytes(),
                 st.session_state.get("uploaded_name", "video.mp4"),
                 st.session_state.get("content_type", "General"),
             )
@@ -414,7 +431,7 @@ if result:
             data=docx_bytes,
             file_name="ai_qc_report.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
+            width='stretch',
         )
     with dl2:
         st.download_button(
@@ -423,7 +440,7 @@ if result:
             file_name="video_qc_report.csv",
             mime="text/csv",
             disabled=not rows,
-            use_container_width=True,
+            width='stretch',
         )
     with dl3:
         st.download_button(
@@ -431,7 +448,7 @@ if result:
             data=json_payload,
             file_name="video_qc_report.json",
             mime="application/json",
-            use_container_width=True,
+            width='stretch',
         )
 
     st.success("Analysis complete")
@@ -503,7 +520,7 @@ if result:
                 color_severity,
                 subset=["Severity"] if "Severity" in df.columns else [],
             )
-            st.dataframe(styled_df, use_container_width=True, height=520)
+            st.dataframe(styled_df, width='stretch', height=520)
 
             # ----- Issue cards: transcript context + jump-to-timestamp -----
             st.markdown("#### Issue details")
@@ -548,17 +565,17 @@ if result:
                         if st.button(
                             f"▶ Jump to {ts}",
                             key=f"jump_{i}_{ts}",
-                            use_container_width=False,
+                            width='content',
                         ):
                             st.session_state["jump_to_time"] = target_sec
                             st.rerun()
 
             # ----- Inline jump-to playback -----
             jump_to = st.session_state.get("jump_to_time")
-            if jump_to is not None and st.session_state.get("video_bytes"):
+            if jump_to is not None and st.session_state.get("video_path"):
                 st.markdown("#### Playback at issue timestamp")
                 st.video(
-                    st.session_state["video_bytes"],
+                    _get_video_bytes(),
                     start_time=int(jump_to),
                 )
                 if st.button("Clear playback", key="clear_jump"):
@@ -618,7 +635,7 @@ if result:
                     cols[i % len(cols)].image(
                         f"data:image/jpeg;base64,{b64}",
                         caption=f"t={ts}",
-                        use_container_width=True,
+                        width='stretch',
                     )
         elif visual.get("frame_timestamps"):
             st.caption("Sampled frames: " + ", ".join(visual["frame_timestamps"]))
