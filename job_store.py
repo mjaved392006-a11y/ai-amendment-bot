@@ -15,6 +15,9 @@ except Exception:
 import boto3
 from supabase import create_client
 
+# Tracks whether we've already pushed the CORS policy this process lifetime.
+_r2_cors_configured = False
+
 
 BUCKET_DEFAULT = "amendment-bot-files"
 R2_BUCKET_DEFAULT = "ai-amendment-videos"
@@ -75,6 +78,36 @@ def _r2_client():
     )
 
 
+def _ensure_r2_cors() -> None:
+    """
+    Push a CORS policy to the R2 bucket so browsers can PUT directly from
+    any origin (e.g. *.streamlit.app).  Only runs once per process lifetime.
+    """
+    global _r2_cors_configured
+    if _r2_cors_configured:
+        return
+    try:
+        _r2_client().put_bucket_cors(
+            Bucket=r2_bucket_name(),
+            CORSConfiguration={
+                "CORSRules": [
+                    {
+                        "AllowedOrigins": ["*"],
+                        "AllowedMethods": ["PUT", "GET", "HEAD"],
+                        "AllowedHeaders": ["*"],
+                        "ExposeHeaders": ["ETag"],
+                        "MaxAgeSeconds": 3600,
+                    }
+                ]
+            },
+        )
+        _r2_cors_configured = True
+    except Exception as exc:
+        # Non-fatal — log and carry on; upload will likely fail with CORS
+        # error in the browser but won't crash the Streamlit app.
+        print(f"[R2] WARNING: could not set CORS policy: {exc}", flush=True)
+
+
 def _safe_filename(name: str) -> str:
     name = Path(name or "video.mp4").name
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
@@ -109,6 +142,10 @@ def _insert_analysis_job(job_id: str, video_path: str, content_type: str) -> dic
 
 
 def create_direct_upload_ticket(content_type: str) -> dict[str, str]:
+    # Ensure the bucket has a CORS policy before handing a presigned URL to
+    # the browser.  This is idempotent and cached after the first call.
+    _ensure_r2_cors()
+
     job_id = str(uuid.uuid4())
     content_slug = _content_slug(content_type)
     video_path = f"uploads/{job_id}/{content_slug}/direct_upload.mp4"
@@ -117,6 +154,9 @@ def create_direct_upload_ticket(content_type: str) -> dict[str, str]:
         Params={
             "Bucket": r2_bucket_name(),
             "Key": video_path,
+            # Signing Content-Type makes CORS preflight and the actual PUT
+            # consistent — the browser must send the same value in both.
+            "ContentType": "video/mp4",
         },
         ExpiresIn=DIRECT_UPLOAD_EXPIRY_SECONDS,
     )

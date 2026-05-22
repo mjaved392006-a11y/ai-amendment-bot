@@ -335,6 +335,9 @@ DIRECT_UPLOAD = components.component(
             try {
                 const response = await fetch(data.ticket.signed_url, {
                     method: "PUT",
+                    // Must match the ContentType we signed into the presigned
+                    // URL on the server side, otherwise R2 returns 403.
+                    headers: { "Content-Type": "video/mp4" },
                     body: file,
                 });
                 if (!response.ok) {
@@ -591,7 +594,9 @@ if video_ready:
                 if worker_progress:
                     st.caption(f"Last worker update: {worker_progress}")
                 st.caption(f"Job ID: {job_id}")
-                time.sleep(5)
+                # Keep sleep short — long sleeps hold the Streamlit thread
+                # and cause the browser WebSocket keepalive to time out.
+                time.sleep(2)
                 st.rerun()
 
 
