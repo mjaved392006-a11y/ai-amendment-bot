@@ -103,9 +103,12 @@ def _ensure_r2_cors() -> None:
         )
         _r2_cors_configured = True
     except Exception as exc:
-        # Non-fatal — log and carry on; upload will likely fail with CORS
-        # error in the browser but won't crash the Streamlit app.
-        print(f"[R2] WARNING: could not set CORS policy: {exc}", flush=True)
+        # Non-fatal — CORS may already be set in the Cloudflare dashboard.
+        # Mark as configured anyway so we don't retry (and spam logs) on
+        # every subsequent ticket creation.
+        print(f"[R2] WARNING: could not set CORS policy via API: {exc}", flush=True)
+        print("[R2] Assuming CORS is already configured in the dashboard.", flush=True)
+        _r2_cors_configured = True
 
 
 def _safe_filename(name: str) -> str:
@@ -237,22 +240,73 @@ def download_video_to_temp(video_path: str) -> str:
     return temp_path
 
 
+def _ensure_result_bucket() -> None:
+    """
+    Create the result-storage bucket if it doesn't already exist.
+    Non-public — access is via the service-role key only.
+    Safe to call repeatedly (list_buckets is cheap).
+    """
+    client = _client()
+    bname = bucket_name()
+    try:
+        existing = [b["name"] for b in (client.storage.list_buckets() or [])]
+        if bname not in existing:
+            client.storage.create_bucket(bname, options={"public": False})
+            print(f"[Storage] Created bucket '{bname}'.", flush=True)
+    except Exception as exc:
+        # Non-fatal — bucket may already exist or list permission may be absent.
+        print(f"[Storage] WARNING: could not ensure bucket '{bname}': {exc}", flush=True)
+
+
 def upload_result(job_id: str, result: dict[str, Any]) -> str:
+    _ensure_result_bucket()
     result_path = f"results/{job_id}/result.json"
     data = json.dumps(result, ensure_ascii=False).encode("utf-8")
-    _client().storage.from_(bucket_name()).upload(
-        result_path,
-        data,
-        file_options={
-            "content-type": "application/json",
-            "upsert": "true",
-        },
-    )
+    client = _client()
+    bname = bucket_name()
+
+    # Try upsert=True (boolean); fall back to remove+upload for older supabase-py
+    # builds that ignore or reject the flag.
+    try:
+        client.storage.from_(bname).upload(
+            result_path,
+            data,
+            file_options={
+                "content-type": "application/json",
+                "upsert": True,
+            },
+        )
+    except Exception as first_exc:
+        try:
+            client.storage.from_(bname).remove([result_path])
+        except Exception:
+            pass
+        try:
+            client.storage.from_(bname).upload(
+                result_path,
+                data,
+                file_options={"content-type": "application/json"},
+            )
+        except Exception as second_exc:
+            raise RuntimeError(
+                f"Failed to upload result to Supabase Storage "
+                f"(bucket='{bname}', path='{result_path}'). "
+                f"First attempt: {first_exc}. Second attempt: {second_exc}."
+            ) from second_exc
+
     return result_path
 
 
 def download_result(result_path: str) -> dict[str, Any]:
-    data = _client().storage.from_(bucket_name()).download(result_path)
+    try:
+        data = _client().storage.from_(bucket_name()).download(result_path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not download QC result from Supabase Storage "
+            f"(bucket='{bucket_name()}', path='{result_path}'). "
+            f"Ensure the bucket exists and the service-role key has storage access. "
+            f"Original error: {exc}"
+        ) from exc
     if isinstance(data, bytes):
         text = data.decode("utf-8")
     else:
