@@ -7,4 +7,3 @@ python-docx
 gdown
 supabase
 openai
-static-ffmpeg
