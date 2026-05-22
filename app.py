@@ -635,7 +635,7 @@ if result:
                     cols[i % len(cols)].image(
                         f"data:image/jpeg;base64,{b64}",
                         caption=f"t={ts}",
-                        use_column_width=True,
+                        use_container_width=True,
                     )
         elif visual.get("frame_timestamps"):
             st.caption("Sampled frames: " + ", ".join(visual["frame_timestamps"]))

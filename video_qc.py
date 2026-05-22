@@ -4,6 +4,9 @@ import re
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import static_ffmpeg
+static_ffmpeg.add_paths()  # puts static ffmpeg/ffprobe on PATH — avoids 250+ apt packages
 from difflib import SequenceMatcher
 
 from transcription_service import transcribe_audio_with_openai
