@@ -520,7 +520,7 @@ if result:
                 color_severity,
                 subset=["Severity"] if "Severity" in df.columns else [],
             )
-            st.dataframe(styled_df, width='stretch', height=520)
+            st.dataframe(styled_df, use_container_width=True, height=520)
 
             # ----- Issue cards: transcript context + jump-to-timestamp -----
             st.markdown("#### Issue details")
@@ -635,7 +635,7 @@ if result:
                     cols[i % len(cols)].image(
                         f"data:image/jpeg;base64,{b64}",
                         caption=f"t={ts}",
-                        width='stretch',
+                        use_column_width=True,
                     )
         elif visual.get("frame_timestamps"):
             st.caption("Sampled frames: " + ", ".join(visual["frame_timestamps"]))
