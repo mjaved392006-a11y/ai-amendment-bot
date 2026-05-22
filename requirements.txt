@@ -7,3 +7,4 @@ python-docx
 gdown
 supabase
 openai
+boto3

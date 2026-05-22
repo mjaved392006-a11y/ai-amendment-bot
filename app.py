@@ -11,7 +11,6 @@ from activity_log import ActivityLog, attach_progress_callback, render_sidebar
 from export_utils import build_report_docx_bytes
 from job_store import (
     create_direct_upload_ticket,
-    direct_upload_public_config,
     download_result,
     get_job,
     submit_analysis_job,
@@ -225,14 +224,14 @@ def _persist_uploaded_video(uploaded):
 
 
 DIRECT_UPLOAD = components.component(
-    "direct_supabase_video_upload",
+    "direct_r2_video_upload",
     html="""
     <section class="direct-upload">
         <label class="file-picker">
             <span>Choose video</span>
             <input type="file" accept=".mp4,.mov,.mkv,.mpeg4,video/*" />
         </label>
-        <button type="button" class="upload-button">Upload to Supabase</button>
+        <button type="button" class="upload-button">Upload video</button>
         <p class="file-note"></p>
         <video class="preview" controls preload="metadata"></video>
         <p class="status" aria-live="polite"></p>
@@ -325,33 +324,21 @@ DIRECT_UPLOAD = components.component(
                 setStatus("Choose a video first.", true);
                 return;
             }
-            if (!data.ticket || !data.ticket.token || !data.ticket.video_path) {
+            if (!data.ticket || !data.ticket.signed_url || !data.ticket.video_path) {
                 setStatus("Upload ticket is missing. Refresh and try again.", true);
-                return;
-            }
-            if (!data.supabase || !data.supabase.url || !data.supabase.key) {
-                setStatus("Public Supabase upload config is missing.", true);
                 return;
             }
 
             button.disabled = true;
-            setStatus("Uploading directly to Supabase. Keep this tab open until it finishes.");
+            setStatus("Uploading directly to Cloudflare R2. Keep this tab open until it finishes.");
 
             try {
-                const { createClient } =
-                    await import("https://esm.sh/@supabase/supabase-js@2");
-                const supabase = createClient(data.supabase.url, data.supabase.key);
-                const { error } = await supabase.storage
-                    .from(data.supabase.bucket)
-                    .uploadToSignedUrl(
-                        data.ticket.video_path,
-                        data.ticket.token,
-                        file,
-                        { contentType: file.type || "video/mp4" },
-                    );
-
-                if (error) {
-                    throw error;
+                const response = await fetch(data.ticket.signed_url, {
+                    method: "PUT",
+                    body: file,
+                });
+                if (!response.ok) {
+                    throw new Error(`R2 upload failed with HTTP ${response.status}.`);
                 }
 
                 setStateValue("uploaded", {
@@ -378,7 +365,7 @@ DIRECT_UPLOAD = components.component(
 # ---------- Upload ----------
 tab_upload, tab_drive = st.tabs(["📁 Upload file", "☁️ Google Drive link"])
 
-# --- Tab 1: browser uploads straight to Supabase Storage ---
+# --- Tab 1: browser uploads straight to Cloudflare R2 ---
 with tab_upload:
     direct_ticket = st.session_state.get("direct_upload_ticket")
     if (
@@ -390,25 +377,15 @@ with tab_upload:
                 st.session_state.get("content_type", "General")
             )
         except Exception as exc:
-            st.error("Could not prepare a direct Supabase upload.")
+            st.error("Could not prepare a direct Cloudflare R2 upload.")
             st.exception(exc)
 
-    try:
-        direct_supabase = direct_upload_public_config()
-    except Exception as exc:
-        direct_supabase = {}
-        st.error("Direct upload needs a public Supabase key in Streamlit secrets.")
-        st.exception(exc)
-
     direct_result = DIRECT_UPLOAD(
-        data={
-            "ticket": st.session_state.get("direct_upload_ticket") or {},
-            "supabase": direct_supabase,
-        },
+        data={"ticket": st.session_state.get("direct_upload_ticket") or {}},
         default={"uploaded": None, "error": None},
         on_uploaded_change=lambda: None,
         on_error_change=lambda: None,
-        key="direct_supabase_video_upload",
+        key="direct_r2_video_upload",
     )
 
     direct_uploaded = direct_result.uploaded if direct_result else None
@@ -431,7 +408,7 @@ with tab_upload:
 
     if st.session_state.get("direct_video_path"):
         size_mb = st.session_state.get("direct_file_size", 0) / (1024 * 1024)
-        st.success("Video uploaded to Supabase Storage.")
+        st.success("Video uploaded to Cloudflare R2.")
         st.metric("File size", f"{size_mb:.1f} MB")
         st.write(f"**File name:** {st.session_state.get('uploaded_name', 'video.mp4')}")
         if size_mb > 500:
@@ -554,8 +531,8 @@ if video_ready:
             st.session_state.pop("edited_transcript_text", None)
         except Exception as exc:
             st.error(
-                "Could not submit analysis job. Check Supabase secrets, bucket name, "
-                "and storage/table permissions."
+                "Could not submit analysis job. Check R2 video storage secrets and "
+                "Supabase job/result permissions."
             )
             st.exception(exc)
             st.stop()

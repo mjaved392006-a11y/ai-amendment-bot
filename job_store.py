@@ -12,10 +12,13 @@ try:
 except Exception:
     st = None
 
+import boto3
 from supabase import create_client
 
 
 BUCKET_DEFAULT = "amendment-bot-files"
+R2_BUCKET_DEFAULT = "ai-amendment-videos"
+DIRECT_UPLOAD_EXPIRY_SECONDS = 60 * 60
 
 CONTENT_TYPE_BY_SLUG = {
     "business-wealth": "Business & Wealth",
@@ -51,19 +54,25 @@ def bucket_name() -> str:
     return _secret("SUPABASE_BUCKET", BUCKET_DEFAULT)
 
 
-def direct_upload_public_config() -> dict[str, str]:
-    url = _secret("SUPABASE_URL")
-    key = _secret("SUPABASE_PUBLISHABLE_KEY") or _secret("SUPABASE_ANON_KEY")
-    if not url or not key:
+def r2_bucket_name() -> str:
+    return _secret("R2_BUCKET", R2_BUCKET_DEFAULT)
+
+
+def _r2_client():
+    access_key_id = _secret("R2_ACCESS_KEY_ID")
+    secret_access_key = _secret("R2_SECRET_ACCESS_KEY")
+    endpoint = _secret("R2_ENDPOINT")
+    if not access_key_id or not secret_access_key or not endpoint:
         raise RuntimeError(
-            "Missing SUPABASE_URL and a public Supabase key. "
-            "Set SUPABASE_PUBLISHABLE_KEY or SUPABASE_ANON_KEY."
+            "Missing R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, or R2_ENDPOINT."
         )
-    return {
-        "url": url,
-        "key": key,
-        "bucket": bucket_name(),
-    }
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key=secret_access_key,
+        region_name="auto",
+    )
 
 
 def _safe_filename(name: str) -> str:
@@ -90,8 +99,8 @@ def _insert_analysis_job(job_id: str, video_path: str, content_type: str) -> dic
         "id": job_id,
         "status": "queued",
         "video_path": video_path,
-        # Store content_type directly so the worker doesn't have to decode it
-        # from the storage path (which is fragile if the slug mapping changes).
+        # Store content_type directly so the worker does not have to decode it
+        # from the object path if the slug mapping changes.
         "content_type": content_type,
     }
     response = _client().table("jobs").insert(payload).execute()
@@ -102,19 +111,19 @@ def _insert_analysis_job(job_id: str, video_path: str, content_type: str) -> dic
 def create_direct_upload_ticket(content_type: str) -> dict[str, str]:
     job_id = str(uuid.uuid4())
     content_slug = _content_slug(content_type)
-    # The browser keeps the display name. The stored path only needs a stable
-    # media suffix for worker temp-file handling.
     video_path = f"uploads/{job_id}/{content_slug}/direct_upload.mp4"
-    response = _client().storage.from_(bucket_name()).create_signed_upload_url(video_path)
-    data = getattr(response, "data", response) or {}
-    token = data.get("token") if isinstance(data, dict) else None
-    if not token:
-        raise RuntimeError("Supabase did not return a signed upload token.")
-
+    signed_url = _r2_client().generate_presigned_url(
+        "put_object",
+        Params={
+            "Bucket": r2_bucket_name(),
+            "Key": video_path,
+        },
+        ExpiresIn=DIRECT_UPLOAD_EXPIRY_SECONDS,
+    )
     return {
         "job_id": job_id,
-        "video_path": data.get("path") or video_path,
-        "token": token,
+        "video_path": video_path,
+        "signed_url": signed_url,
         "content_type": content_type,
     }
 
@@ -131,14 +140,11 @@ def submit_analysis_job(video_bytes: bytes, filename: str, content_type: str) ->
     content_slug = _content_slug(content_type)
     video_path = f"uploads/{job_id}/{content_slug}/{safe_name}"
 
-    client = _client()
-    client.storage.from_(bucket_name()).upload(
-        video_path,
-        video_bytes,
-        file_options={
-            "content-type": "video/mp4",
-            "upsert": "true",
-        },
+    _r2_client().put_object(
+        Bucket=r2_bucket_name(),
+        Key=video_path,
+        Body=video_bytes,
+        ContentType="video/mp4",
     )
 
     return _insert_analysis_job(job_id, video_path, content_type)
@@ -184,12 +190,10 @@ def claim_next_job() -> dict[str, Any] | None:
 
 
 def download_video_to_temp(video_path: str) -> str:
-    data = _client().storage.from_(bucket_name()).download(video_path)
     suffix = Path(video_path).suffix or ".mp4"
     fd, temp_path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
-    with open(temp_path, "wb") as f:
-        f.write(data)
+    _r2_client().download_file(r2_bucket_name(), video_path, temp_path)
     return temp_path
 
 
