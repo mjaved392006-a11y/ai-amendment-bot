@@ -5,10 +5,18 @@ import time
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v2 as components
 
 from activity_log import ActivityLog, attach_progress_callback, render_sidebar
 from export_utils import build_report_docx_bytes
-from job_store import download_result, get_job, submit_analysis_job
+from job_store import (
+    create_direct_upload_ticket,
+    direct_upload_public_config,
+    download_result,
+    get_job,
+    submit_analysis_job,
+    submit_uploaded_analysis_job,
+)
 from video_qc import run_qc_checks_only
 from google_drive import download_drive_video, is_drive_url, GDOWN_AVAILABLE
 
@@ -68,7 +76,8 @@ with st.sidebar:
             "qc_result", "video_path", "video_mime",
             "uploaded_name", "activity_log_entries", "activity_log_started_at",
             "edited_transcript_text", "analysis_job_id", "analysis_job_started_at",
-            "analysis_job_status",
+            "analysis_job_status", "direct_upload_ticket", "direct_upload_marker",
+            "direct_upload_job_id", "direct_video_path", "direct_file_size",
         ):
             st.session_state.pop(key, None)
         st.rerun()
@@ -215,12 +224,223 @@ def _persist_uploaded_video(uploaded):
     return path
 
 
+DIRECT_UPLOAD = components.component(
+    "direct_supabase_video_upload",
+    html="""
+    <section class="direct-upload">
+        <label class="file-picker">
+            <span>Choose video</span>
+            <input type="file" accept=".mp4,.mov,.mkv,.mpeg4,video/*" />
+        </label>
+        <button type="button" class="upload-button">Upload to Supabase</button>
+        <p class="file-note"></p>
+        <video class="preview" controls preload="metadata"></video>
+        <p class="status" aria-live="polite"></p>
+    </section>
+    """,
+    css="""
+    .direct-upload {
+        color: inherit;
+        display: grid;
+        font-family: inherit;
+        gap: 0.65rem;
+    }
+    .file-picker {
+        align-items: center;
+        border: 1px dashed rgba(128, 128, 128, 0.7);
+        border-radius: 8px;
+        cursor: pointer;
+        display: flex;
+        min-height: 3.1rem;
+        padding: 0 0.9rem;
+    }
+    .file-picker input {
+        margin-left: 0.8rem;
+        max-width: 100%;
+    }
+    .upload-button {
+        background: #ff4b4b;
+        border: 0;
+        border-radius: 8px;
+        color: #fff;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 600;
+        height: 2.7rem;
+        justify-self: start;
+        padding: 0 1rem;
+    }
+    .upload-button:disabled {
+        cursor: wait;
+        opacity: 0.6;
+    }
+    .file-note, .status {
+        margin: 0;
+    }
+    .preview {
+        display: none;
+        max-height: 28rem;
+        max-width: 100%;
+        width: 100%;
+    }
+    .preview.ready {
+        display: block;
+    }
+    .status.error {
+        color: #ff4b4b;
+    }
+    """,
+    js="""
+    export default function(component) {
+        const { data, parentElement, setStateValue } = component;
+        const input = parentElement.querySelector("input");
+        const button = parentElement.querySelector(".upload-button");
+        const fileNote = parentElement.querySelector(".file-note");
+        const preview = parentElement.querySelector(".preview");
+        const status = parentElement.querySelector(".status");
+
+        const setStatus = (message, isError = false) => {
+            status.textContent = message || "";
+            status.classList.toggle("error", isError);
+        };
+
+        input.onchange = () => {
+            const file = input.files && input.files[0];
+            if (!file) {
+                fileNote.textContent = "";
+                preview.removeAttribute("src");
+                preview.classList.remove("ready");
+                return;
+            }
+            fileNote.textContent =
+                `${file.name} - ${(file.size / (1024 * 1024)).toFixed(1)} MB`;
+            preview.src = URL.createObjectURL(file);
+            preview.classList.add("ready");
+            setStatus("");
+        };
+
+        button.onclick = async () => {
+            const file = input.files && input.files[0];
+            if (!file) {
+                setStatus("Choose a video first.", true);
+                return;
+            }
+            if (!data.ticket || !data.ticket.token || !data.ticket.video_path) {
+                setStatus("Upload ticket is missing. Refresh and try again.", true);
+                return;
+            }
+            if (!data.supabase || !data.supabase.url || !data.supabase.key) {
+                setStatus("Public Supabase upload config is missing.", true);
+                return;
+            }
+
+            button.disabled = true;
+            setStatus("Uploading directly to Supabase. Keep this tab open until it finishes.");
+
+            try {
+                const { createClient } =
+                    await import("https://esm.sh/@supabase/supabase-js@2");
+                const supabase = createClient(data.supabase.url, data.supabase.key);
+                const { error } = await supabase.storage
+                    .from(data.supabase.bucket)
+                    .uploadToSignedUrl(
+                        data.ticket.video_path,
+                        data.ticket.token,
+                        file,
+                        { contentType: file.type || "video/mp4" },
+                    );
+
+                if (error) {
+                    throw error;
+                }
+
+                setStateValue("uploaded", {
+                    job_id: data.ticket.job_id,
+                    video_path: data.ticket.video_path,
+                    filename: file.name,
+                    file_size: file.size,
+                    uploaded_at: Date.now(),
+                });
+                setStatus("Upload complete. Click Analyze Video below.");
+            } catch (error) {
+                const message = error && error.message ? error.message : String(error);
+                setStateValue("error", message);
+                setStatus(`Upload failed: ${message}`, true);
+            } finally {
+                button.disabled = false;
+            }
+        };
+    }
+    """,
+)
+
+
 # ---------- Upload ----------
 tab_upload, tab_drive = st.tabs(["📁 Upload file", "☁️ Google Drive link"])
 
-# --- Tab 1: direct file upload ---
+# --- Tab 1: browser uploads straight to Supabase Storage ---
 with tab_upload:
-    uploaded = st.file_uploader("Upload video", type=["mp4", "mov", "mkv", "mpeg4"])
+    direct_ticket = st.session_state.get("direct_upload_ticket")
+    if (
+        not direct_ticket
+        or direct_ticket.get("content_type") != st.session_state.get("content_type", "General")
+    ):
+        try:
+            st.session_state["direct_upload_ticket"] = create_direct_upload_ticket(
+                st.session_state.get("content_type", "General")
+            )
+        except Exception as exc:
+            st.error("Could not prepare a direct Supabase upload.")
+            st.exception(exc)
+
+    try:
+        direct_supabase = direct_upload_public_config()
+    except Exception as exc:
+        direct_supabase = {}
+        st.error("Direct upload needs a public Supabase key in Streamlit secrets.")
+        st.exception(exc)
+
+    direct_result = DIRECT_UPLOAD(
+        data={
+            "ticket": st.session_state.get("direct_upload_ticket") or {},
+            "supabase": direct_supabase,
+        },
+        default={"uploaded": None, "error": None},
+        on_uploaded_change=lambda: None,
+        on_error_change=lambda: None,
+        key="direct_supabase_video_upload",
+    )
+
+    direct_uploaded = direct_result.uploaded if direct_result else None
+    if direct_uploaded and direct_uploaded.get("video_path"):
+        upload_marker = (
+            direct_uploaded.get("job_id"),
+            direct_uploaded.get("uploaded_at"),
+        )
+        if st.session_state.get("direct_upload_marker") != upload_marker:
+            st.session_state["direct_upload_marker"] = upload_marker
+            st.session_state["direct_upload_job_id"] = direct_uploaded["job_id"]
+            st.session_state["direct_video_path"] = direct_uploaded["video_path"]
+            st.session_state["uploaded_name"] = direct_uploaded.get("filename") or "video.mp4"
+            st.session_state["direct_file_size"] = int(direct_uploaded.get("file_size") or 0)
+            st.session_state.pop("video_path", None)
+            st.session_state.pop("qc_result", None)
+            st.session_state.pop("analysis_job_id", None)
+            st.session_state.pop("analysis_job_started_at", None)
+            st.session_state.pop("analysis_job_status", None)
+
+    if st.session_state.get("direct_video_path"):
+        size_mb = st.session_state.get("direct_file_size", 0) / (1024 * 1024)
+        st.success("Video uploaded to Supabase Storage.")
+        st.metric("File size", f"{size_mb:.1f} MB")
+        st.write(f"**File name:** {st.session_state.get('uploaded_name', 'video.mp4')}")
+        if size_mb > 500:
+            st.warning(
+                "Large file - transcription and analysis may take several minutes "
+                "and cost more API credits."
+            )
+
+    uploaded = None
 
     if uploaded:
         video_path = _persist_uploaded_video(uploaded)
@@ -292,7 +512,15 @@ with tab_drive:
             st.metric("File size", f"{size_mb:.1f} MB")
 
 # --- Shared: show Analyze button if any video is ready ---
-video_ready = bool(st.session_state.get("video_path") and os.path.exists(st.session_state.get("video_path", "")))
+local_video_ready = bool(
+    st.session_state.get("video_path")
+    and os.path.exists(st.session_state.get("video_path", ""))
+)
+direct_video_ready = bool(
+    st.session_state.get("direct_upload_job_id")
+    and st.session_state.get("direct_video_path")
+)
+video_ready = local_video_ready or direct_video_ready
 
 if video_ready:
 
@@ -306,13 +534,20 @@ if video_ready:
     if analyze_clicked:
         try:
             activity_log.reset()
-            activity_log.emit("job_submit", "Uploading video and creating background analysis job...")
+            activity_log.emit("job_submit", "Creating background analysis job...")
             render_sidebar(activity_log, activity_placeholder)
-            job = submit_analysis_job(
-                _get_video_bytes(),
-                st.session_state.get("uploaded_name", "video.mp4"),
-                st.session_state.get("content_type", "General"),
-            )
+            if direct_video_ready:
+                job = submit_uploaded_analysis_job(
+                    st.session_state["direct_upload_job_id"],
+                    st.session_state["direct_video_path"],
+                    st.session_state.get("content_type", "General"),
+                )
+            else:
+                job = submit_analysis_job(
+                    _get_video_bytes(),
+                    st.session_state.get("uploaded_name", "video.mp4"),
+                    st.session_state.get("content_type", "General"),
+                )
             st.session_state["analysis_job_id"] = job["id"]
             st.session_state["analysis_job_started_at"] = time.time()
             st.session_state["analysis_job_status"] = job.get("status", "queued")

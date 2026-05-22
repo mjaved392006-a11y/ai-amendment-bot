@@ -51,6 +51,21 @@ def bucket_name() -> str:
     return _secret("SUPABASE_BUCKET", BUCKET_DEFAULT)
 
 
+def direct_upload_public_config() -> dict[str, str]:
+    url = _secret("SUPABASE_URL")
+    key = _secret("SUPABASE_PUBLISHABLE_KEY") or _secret("SUPABASE_ANON_KEY")
+    if not url or not key:
+        raise RuntimeError(
+            "Missing SUPABASE_URL and a public Supabase key. "
+            "Set SUPABASE_PUBLISHABLE_KEY or SUPABASE_ANON_KEY."
+        )
+    return {
+        "url": url,
+        "key": key,
+        "bucket": bucket_name(),
+    }
+
+
 def _safe_filename(name: str) -> str:
     name = Path(name or "video.mp4").name
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
@@ -70,6 +85,46 @@ def content_type_from_video_path(video_path: str) -> str:
     return "General"
 
 
+def _insert_analysis_job(job_id: str, video_path: str, content_type: str) -> dict[str, Any]:
+    payload = {
+        "id": job_id,
+        "status": "queued",
+        "video_path": video_path,
+        # Store content_type directly so the worker doesn't have to decode it
+        # from the storage path (which is fragile if the slug mapping changes).
+        "content_type": content_type,
+    }
+    response = _client().table("jobs").insert(payload).execute()
+    rows = response.data or []
+    return rows[0] if rows else payload
+
+
+def create_direct_upload_ticket(content_type: str) -> dict[str, str]:
+    job_id = str(uuid.uuid4())
+    content_slug = _content_slug(content_type)
+    # The browser keeps the display name. The stored path only needs a stable
+    # media suffix for worker temp-file handling.
+    video_path = f"uploads/{job_id}/{content_slug}/direct_upload.mp4"
+    response = _client().storage.from_(bucket_name()).create_signed_upload_url(video_path)
+    data = getattr(response, "data", response) or {}
+    token = data.get("token") if isinstance(data, dict) else None
+    if not token:
+        raise RuntimeError("Supabase did not return a signed upload token.")
+
+    return {
+        "job_id": job_id,
+        "video_path": data.get("path") or video_path,
+        "token": token,
+        "content_type": content_type,
+    }
+
+
+def submit_uploaded_analysis_job(job_id: str, video_path: str, content_type: str) -> dict[str, Any]:
+    if not job_id or not video_path:
+        raise ValueError("Direct upload job_id and video_path are required.")
+    return _insert_analysis_job(job_id, video_path, content_type)
+
+
 def submit_analysis_job(video_bytes: bytes, filename: str, content_type: str) -> dict[str, Any]:
     job_id = str(uuid.uuid4())
     safe_name = _safe_filename(filename)
@@ -86,17 +141,7 @@ def submit_analysis_job(video_bytes: bytes, filename: str, content_type: str) ->
         },
     )
 
-    payload = {
-        "id": job_id,
-        "status": "queued",
-        "video_path": video_path,
-        # Store content_type directly so the worker doesn't have to decode it
-        # from the storage path (which is fragile if the slug mapping changes).
-        "content_type": content_type,
-    }
-    response = client.table("jobs").insert(payload).execute()
-    rows = response.data or []
-    return rows[0] if rows else payload
+    return _insert_analysis_job(job_id, video_path, content_type)
 
 
 def get_job(job_id: str) -> dict[str, Any] | None:
